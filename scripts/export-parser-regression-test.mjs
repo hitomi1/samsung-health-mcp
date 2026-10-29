@@ -110,12 +110,14 @@ const jan1Ms = Date.UTC(2026, 0, 1);
 await withExport({
   'heart_rate.csv': [
     'start_time,end_time,time_offset,heart_rate,source_name',
-    // In-range ISO with offset (existing fixture shape).
+    // Samsung start_time is UTC; time_offset is the device zone and must not
+    // shift it. All three are inside May 1 UTC whatever their offset says.
     '2026-05-01 08:05:00.000,2026-05-01 08:06:00.000,UTC-0300,62,Galaxy Watch',
-    // In range only after UTC-12 is applied: raw UTC is 12h before the window.
-    '2026-04-30 12:00:00,2026-04-30 12:01:00,UTC-1200,63,Galaxy Watch',
-    // UTC+14 raw looks 14h after the window end; actual UTC is still May 1.
-    '2026-05-02 13:00:00,2026-05-02 13:01:00,UTC+1400,64,Galaxy Watch',
+    '2026-05-01 00:30:00,2026-05-01 00:31:00,UTC-1200,63,Galaxy Watch',
+    '2026-05-01 23:00:00,2026-05-01 23:01:00,UTC+1400,64,Galaxy Watch',
+    // Outside May 1 UTC: reapplying the offset would wrongly pull these in.
+    '2026-04-30 12:00:00,2026-04-30 12:01:00,UTC-1200,53,Galaxy Watch',
+    '2026-05-02 13:00:00,2026-05-02 13:01:00,UTC+1400,54,Galaxy Watch',
     // Exact window edges must survive the slack pre-filter.
     '2026-05-01T00:00:00.000Z,2026-05-01T00:01:00.000Z,,65,Galaxy Watch',
     '2026-05-01T23:59:59.000Z,2026-05-01T23:59:59.000Z,,66,Galaxy Watch',
@@ -144,8 +146,10 @@ await withExport({
   const values = ranged.map((record) => record.numeric_value).sort((a, b) => a - b);
   assert.deepEqual(values, [62, 63, 64, 65, 66, 67, 68, 70]);
 
+  const offsetMinus3 = ranged.find((record) => record.numeric_value === 62);
+  assert.equal(offsetMinus3?.startDate, '2026-05-01T08:05:00.000Z');
   const offsetMinus12 = ranged.find((record) => record.numeric_value === 63);
-  assert.equal(offsetMinus12?.startDate, '2026-05-01T00:00:00.000Z');
+  assert.equal(offsetMinus12?.startDate, '2026-05-01T00:30:00.000Z');
   const offsetPlus14 = ranged.find((record) => record.numeric_value === 64);
   assert.equal(offsetPlus14?.startDate, '2026-05-01T23:00:00.000Z');
 
@@ -207,6 +211,50 @@ start_time;oxygen_saturation;heart_rate;note
   assert.equal(records[0]?.startDate, '2026-05-01T12:00:00.000Z');
 });
 
+// Daily tables: day_time is the local date written as midnight UTC. It must
+// land on that local date in a zone west of UTC, not the day before.
+// Also: active_calorie (not tef/rest) is the energy value, the step row's
+// distance becomes a km record, and Samsung exercise duration is always ms.
+await withExport({
+  'com.samsung.shealth.step_daily_trend.20261001000000.csv': [
+    'com.samsung.shealth.step_daily_trend,7010053,6',
+    'binning_data,source_type,count,speed,distance,calorie,day_time',
+    ',-2,8000,1.2,6400,300,2026-05-02 00:00:00.000',
+    ',0,5000,1.2,4000,190,2026-05-02 00:00:00.000',
+    ',-2,3000,1.2,80,90,2026-05-03 00:00:00.000',
+    ''
+  ].join('\n'),
+  'com.samsung.shealth.calories_burned.details.20261001000000.csv': [
+    'com.samsung.shealth.calories_burned.details,7010053,2',
+    'active_calories_goal,tef_calorie,rest_calorie,active_calorie,day_time',
+    '500,150,1700,420.5,2026-05-02 00:00:00.000',
+    ''
+  ].join('\n'),
+  'com.samsung.shealth.exercise.20261001000000.csv': [
+    'com.samsung.shealth.exercise,7010053,4',
+    'exercise_type,duration,com.samsung.health.exercise.start_time,com.samsung.health.exercise.end_time,time_offset',
+    // Watch record and its minute-rounded phone copy of the same run.
+    '1002,2400769,2026-05-02 14:59:30.839,2026-05-02 15:39:31.608,UTC-0300',
+    '1002,2400000,2026-05-02 14:59:00.000,2026-05-02 15:39:00.000,UTC-0300',
+    // A 60 s walk: 60000 ms is one minute, not 1000.
+    '1001,60000,2026-05-02 20:00:00.000,2026-05-02 20:01:00.000,UTC-0300',
+    ''
+  ].join('\n')
+}, async (dir) => {
+  const { buildDailySummary } = await import('../dist/services/summary.js');
+  const may2 = await buildDailySummary(dir, '2026-05-02', { timezone: 'America/Sao_Paulo' });
+  assert.equal(may2.totals.steps, 8000);
+  assert.equal(may2.totals.distance, 6.4);
+  assert.equal(may2.totals.active_energy_kcal, 420.5);
+  assert.equal(may2.workouts.count, 2, 'watch + phone copy of one run count once');
+  assert.equal(may2.workouts.total_duration_minutes, 41.01);
+  const may1 = await buildDailySummary(dir, '2026-05-01', { timezone: 'America/Sao_Paulo' });
+  assert.equal(may1.totals.steps, 0, 'day_time must not slide onto the previous local day');
+  const may3 = await buildDailySummary(dir, '2026-05-03', { timezone: 'Asia/Tokyo' });
+  assert.equal(may3.totals.steps, 3000);
+  assert.equal(may3.totals.distance, 0.08, 'distance is metres even below 100');
+});
+
 console.log(JSON.stringify({
   ok: true,
   export_parser_regression: true,
@@ -217,13 +265,18 @@ console.log(JSON.stringify({
     'heart_rate_filename_with_oxygen_column',
     'column_fallback_heart_rate',
     'hrv_before_heart_rate',
-    'time_offset_utc_minus_12_and_plus_14',
+    'time_offset_is_not_reapplied_to_utc_start_time',
     'range_edge_inclusive',
     'ms_and_second_epoch',
     'empty_start_uses_end',
     'unfiltered_keeps_far_and_unparseable_rows',
     'ranged_count_matches_hand_filter',
     'shortest_suffix_date_column',
-    'parse_csv_bom_preamble_semicolon'
+    'parse_csv_bom_preamble_semicolon',
+    'day_time_anchors_to_local_date',
+    'calories_burned_details_active_calorie',
+    'step_daily_trend_distance_metres',
+    'samsung_exercise_duration_is_ms',
+    'duplicate_watch_phone_workout_counted_once'
   ]
 }, null, 2));

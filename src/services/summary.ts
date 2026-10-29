@@ -157,7 +157,7 @@ function summarizeDay(records: SamsungHealthRecord[], workouts: SamsungHealthWor
 }) {
   const privacyMode = options.privacyMode ?? "summary";
   const dayRecords = records.filter((record) => recordOverlaps(record.startDate, record.endDate, window.start, window.end));
-  const dayWorkouts = workouts.filter((workout) => recordOverlaps(workout.startDate, workout.endDate, window.start, window.end));
+  const dayWorkouts = dedupeWorkouts(workouts.filter((workout) => recordOverlaps(workout.startDate, workout.endDate, window.start, window.end)));
   const workoutView = workoutPrivacyView(dayWorkouts, privacyMode, options.timezone);
   const steps = sumType(dayRecords, "samsung_health_steps");
   const activeEnergy = sumType(dayRecords, "samsung_health_active_energy");
@@ -410,6 +410,37 @@ function recordDurationMinutes(record: SamsungHealthRecord): number {
   const end = parseSamsungDate(record.endDate);
   if (!start || !end) return 0;
   return Math.max(0, end.getTime() - start.getTime()) / 60000;
+}
+
+/**
+ * Samsung often stores one session twice: the watch's record (millisecond
+ * timestamps) and a phone-side copy rounded to the minute. Treat two workouts
+ * of the same activity type as one when their overlap covers at least half of
+ * the shorter one, and keep the longer record.
+ */
+function dedupeWorkouts(workouts: SamsungHealthWorkout[]): SamsungHealthWorkout[] {
+  const sorted = workouts.slice().sort((left, right) => workoutDurationMinutes(right) - workoutDurationMinutes(left));
+  const kept: SamsungHealthWorkout[] = [];
+  for (const workout of sorted) {
+    const interval = workoutInterval(workout);
+    const duplicate = interval && kept.some((other) => {
+      if (other.workoutActivityType !== workout.workoutActivityType) return false;
+      const otherInterval = workoutInterval(other);
+      if (!otherInterval) return false;
+      const overlap = Math.min(interval.end, otherInterval.end) - Math.max(interval.start, otherInterval.start);
+      const shorter = Math.min(interval.end - interval.start, otherInterval.end - otherInterval.start);
+      return shorter > 0 && overlap >= shorter / 2;
+    });
+    if (!duplicate) kept.push(workout);
+  }
+  return workouts.filter((workout) => kept.includes(workout));
+}
+
+function workoutInterval(workout: SamsungHealthWorkout): TimeInterval | undefined {
+  const start = parseSamsungDate(workout.startDate)?.getTime();
+  const end = parseSamsungDate(workout.endDate)?.getTime();
+  if (start === undefined || end === undefined || end <= start) return undefined;
+  return { start, end };
 }
 
 function workoutDurationMinutes(workout: SamsungHealthWorkout): number {

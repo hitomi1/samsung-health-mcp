@@ -347,6 +347,8 @@ async function parseExportEntities(
       }
       const record = rowToRecord(source.name, row);
       if (record) stopped = visitor.onRecord?.(record) ?? false;
+      const distance = record && !stopped ? stepTrendDistance(source.name, row, record) : undefined;
+      if (distance) stopped = visitor.onRecord?.(distance) ?? false;
     }
   }
 }
@@ -400,8 +402,9 @@ function rowToRecord(sourceName: string, row: CsvRow): SamsungHealthRecord | und
   const type = inferRecordType(normalizedFile, row);
   if (!type) return undefined;
 
-  const startDate = bestDate(row, DATE_KEYS.start);
-  const endDate = bestDate(row, DATE_KEYS.end) ?? startDate;
+  const dayAnchor = localDayAnchor(row);
+  const startDate = dayAnchor ?? bestDate(row, DATE_KEYS.start);
+  const endDate = dayAnchor ?? bestDate(row, DATE_KEYS.end) ?? startDate;
   const creationDate = bestDate(row, DATE_KEYS.created);
   const metric = metricForRecord(type, normalizedFile, row, startDate, endDate);
   if (metric.value === undefined && !startDate && !endDate) return undefined;
@@ -422,11 +425,29 @@ function rowToRecord(sourceName: string, row: CsvRow): SamsungHealthRecord | und
   };
 }
 
+/**
+ * The canonical daily step row also carries that day's walking distance in
+ * metres. No other Samsung table gives a daily distance total, so emit it as
+ * a companion record sharing the step row's day anchor.
+ */
+function stepTrendDistance(sourceName: string, row: CsvRow, steps: SamsungHealthRecord): SamsungHealthRecord | undefined {
+  if (steps.type !== "samsung_health_steps") return undefined;
+  if (samsungDataTypeFromFile(normalizeKey(basename(sourceName))) !== "step_daily_trend") return undefined;
+  const meters = readNumber(row, ["distance"]);
+  if (meters === undefined) return undefined;
+  const km = round(meters / 1000);
+  return { ...steps, type: "samsung_health_distance", unit: "km", value: String(km), numeric_value: km };
+}
+
 function rowToWorkout(sourceName: string, row: CsvRow): SamsungHealthWorkout | undefined {
   if (!isWorkoutSource(sourceName)) return undefined;
   const startDate = bestDate(row, DATE_KEYS.start);
   const endDate = bestDate(row, DATE_KEYS.end) ?? startDate;
-  const duration = durationMinutes(row, startDate, endDate);
+  // Samsung's exercise table always stores `duration` in milliseconds. The
+  // generic heuristic in durationMinutes reads 1-100 s as seconds, so a 60 s
+  // session (60000) became 1000 minutes.
+  const samsungDurationMs = isSamsungExerciseSource(sourceName) ? readNumber(row, ["duration"]) : undefined;
+  const duration = samsungDurationMs !== undefined ? round(samsungDurationMs / 60_000) : durationMinutes(row, startDate, endDate);
   const distance = readNumber(row, ["distance", "total_distance", "distance_meter", "distance_m", "distance_km"]);
   const energy = readNumber(row, ["calorie", "calories", "calorie_count", "kcal", "total_calorie", "active_calorie"]);
   const workoutActivityType = readString(row, ["exercise_type", "exercise_name", "activity_type", "workout_type", "type", "name"]) ?? "exercise";
@@ -475,6 +496,8 @@ function inferRecordType(normalizedFile: string, row: CsvRow): string | undefine
     if (samsungType === "body_fat") return "samsung_health_body_fat";
     if (samsungType === "distance") return "samsung_health_distance";
     if (samsungType === "calorie" || samsungType === "calories" || samsungType === "active_energy") return "samsung_health_active_energy";
+    // One row per local day with the app's active-calorie total.
+    if (samsungType === "calories_burned_details") return "samsung_health_active_energy";
     return `samsung_health_${samsungType}`;
   }
   const haystack = `${normalizedFile} ${rowKeys}`;
@@ -541,7 +564,10 @@ function metricForRecord(type: string, normalizedFile: string, row: CsvRow, star
     case "samsung_health_distance":
       return { value: normalizeDistance(readNumber(row, ["distance", "distance_meter", "distance_m", "distance_km", "value"]), row), unit: "km" };
     case "samsung_health_active_energy":
-      return { value: readNumber(row, ["calorie", "calories", "calorie_count", "kcal", "value"]), unit: "kcal" };
+      // `active_calorie` first: calories_burned.details also carries
+      // `tef_calorie` and `rest_calorie`, which the shorter `calorie` suffix
+      // match would otherwise pick.
+      return { value: readNumber(row, ["active_calorie", "calorie", "calories", "calorie_count", "kcal", "value"]), unit: "kcal" };
     case "samsung_health_sleep":
     case "samsung_health_sleep_stage":
       return { value: durationMinutes(row, startDate, endDate), unit: "min" };
@@ -770,9 +796,12 @@ function isSamsungExportPreamble(row: string[]): boolean {
 }
 
 function isWorkoutSource(sourceName: string): boolean {
-  const fileName = basename(sourceName);
-  if (/^com\.samsung\.(?:shealth|health)\.exercise(?:\.\d+)?\.csv$/i.test(fileName)) return true;
-  return /(?:^|[._-])workouts?(?:[._-]|$)/i.test(fileName);
+  if (isSamsungExerciseSource(sourceName)) return true;
+  return /(?:^|[._-])workouts?(?:[._-]|$)/i.test(basename(sourceName));
+}
+
+function isSamsungExerciseSource(sourceName: string): boolean {
+  return /^com\.samsung\.(?:shealth|health)\.exercise(?:\.\d+)?\.csv$/i.test(basename(sourceName));
 }
 
 function detectDelimiter(line: string): "," | ";" | "\t" {
@@ -784,20 +813,32 @@ function detectDelimiter(line: string): "," | ";" | "\t" {
   return Object.entries(counts).sort((left, right) => right[1] - left[1])[0]?.[0] as "," | ";" | "\t" ?? ",";
 }
 
+/**
+ * Samsung Health writes `start_time`/`end_time` in UTC. The sibling
+ * `time_offset` column (`UTC-0300`) only records the zone the device was in,
+ * so it must not be applied again: doing so shifts every reading by the offset
+ * and moves records near midnight onto the wrong local day. Verified against a
+ * real export: per-minute pedometer rows summed by UTC-plus-offset day match
+ * the app's per-device daily totals exactly; reading them as local time does not.
+ */
 function bestDate(row: CsvRow, aliases: string[]): string | undefined {
-  const value = readString(row, aliases);
-  const parsed = parseSamsungDate(combineDateAndOffset(value, readString(row, ["time_offset"])));
-  return parsed?.toISOString();
+  return parseSamsungDate(readString(row, aliases))?.toISOString();
 }
 
-function combineDateAndOffset(value: string | undefined, offset: string | undefined): string | undefined {
-  if (!value || !offset) return value;
-  const trimmed = value.trim();
-  if (/^\d+(?:\.\d+)?$/.test(trimmed) || /(?:Z|[+-]\d{2}:?\d{2})$/i.test(trimmed)) return value;
-  const match = /^UTC([+-])(\d{2}):?(\d{2})?$/i.exec(offset.trim());
-  if (!match) return value;
-  const isoBase = trimmed.includes("T") ? trimmed : trimmed.replace(" ", "T");
-  return `${isoBase}${match[1]}${match[2]}:${match[3] ?? "00"}`;
+/**
+ * Daily tables (`step_daily_trend`, `calories_burned.details`, day summaries)
+ * have no `start_time`, only a `day_time` that is the local calendar date
+ * written as midnight UTC. Read literally it lands on the previous day for
+ * any zone west of UTC, so anchor it to noon UTC of that date instead, which
+ * falls inside the same calendar day for offsets from UTC-12 to UTC+11.
+ */
+function localDayAnchor(row: CsvRow): string | undefined {
+  if (readString(row, ["start_time"])) return undefined;
+  const value = readString(row, ["day_time"]);
+  if (!value || /(?:Z|[+-]\d{2}:?\d{2})$/i.test(value)) return undefined;
+  const parsed = parseSamsungDate(value);
+  if (!parsed) return undefined;
+  return new Date(Date.UTC(parsed.getUTCFullYear(), parsed.getUTCMonth(), parsed.getUTCDate(), 12)).toISOString();
 }
 
 function readString(row: CsvRow, aliases: string[]): string | undefined {
